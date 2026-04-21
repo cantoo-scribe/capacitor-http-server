@@ -211,7 +211,8 @@ class HttpServerPlugin : Plugin() {
         }
 
         // Drain pending requests first so blocked worker threads unblock
-        // before we tear down the underlying socket.
+        // before we tear down the underlying socket. This just flips latches
+        // and returns immediately, so it is safe on the main thread.
         requestBridge.drain(
             HttpRequestBridge.PendingResponse(
                 status = 503,
@@ -222,13 +223,20 @@ class HttpServerPlugin : Plugin() {
             )
         )
 
-        if (srv != null) {
-            try { srv.stop() } catch (_: Throwable) {}
-        }
-
-        HttpServerService.stop(appContext())
-        cleanupTempDir()
-        call.resolve()
+        // NanoHTTPD.stop() calls serverThread.join() and waits for every
+        // worker thread to return. Running that on Capacitor's default UI
+        // thread produces an ANR (and Android then kills the app) as soon
+        // as any worker is still finishing the last write. Push the socket
+        // teardown onto a background thread and only resolve the promise
+        // once everything is actually closed, so a follow-up start() does
+        // not collide with the old socket.
+        val ctx = appContext()
+        Thread({
+            try { srv?.stop() } catch (_: Throwable) {}
+            try { HttpServerService.stop(ctx) } catch (_: Throwable) {}
+            cleanupTempDir()
+            call.resolve()
+        }, "HttpServerPlugin-stop").start()
     }
 
     @PluginMethod

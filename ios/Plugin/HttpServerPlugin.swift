@@ -155,12 +155,25 @@ public class HttpServerPlugin: CAPPlugin {
             requestBridge.drainAll(with: draining)
         }
 
-        server?.removeAllHandlers()
-        server?.stop()
-
-        cleanupTempDir()
-        endBackgroundTask()
-        call.resolve()
+        // Do NOT call server?.removeAllHandlers() on a running server:
+        // GCDWebServer asserts `_options == nil` inside that method
+        // (GWS_DCHECK in GCDWebServer.m), and in Debug builds GWS_DCHECK
+        // is `abort()`. That would crash the host app deterministically
+        // on every stop(). We don't need it anyway — we drop our only
+        // reference to the GCDWebServer instance below and ARC releases
+        // it, taking the handlers with it.
+        //
+        // GCDWebServer.stop() itself waits on an internal semaphore and can
+        // block while in-flight requests unwind, so run the teardown on a
+        // background queue and only resolve the JS promise once the socket
+        // is actually closed; that way a start() issued right after
+        // stopServer() cannot race the old socket.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            server?.stop()
+            self?.cleanupTempDir()
+            self?.endBackgroundTask()
+            call.resolve()
+        }
     }
 
     @objc func respond(_ call: CAPPluginCall) {
