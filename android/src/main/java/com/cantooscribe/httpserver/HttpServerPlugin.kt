@@ -134,7 +134,12 @@ class HttpServerPlugin : Plugin() {
                     currentPort = port
                     isStopping = false
                 } catch (e: Throwable) {
-                    call.reject("Failed to start server: ${e.message}", e)
+                    // PluginCall.reject(String, Exception) cannot accept a raw
+                    // Throwable, so wrap errors (OOM, etc.) in an Exception.
+                    call.reject(
+                        "Failed to start server: ${e.message}",
+                        e as? Exception ?: RuntimeException(e)
+                    )
                     return
                 }
             }
@@ -175,7 +180,10 @@ class HttpServerPlugin : Plugin() {
                     )
                 )
                 try { srv?.stop() } catch (_: Throwable) {}
-                call.reject("Failed to start foreground service: ${e.message}", e)
+                call.reject(
+                    "Failed to start foreground service: ${e.message}",
+                    e as? Exception ?: RuntimeException(e)
+                )
                 return
             }
 
@@ -466,8 +474,10 @@ class HttpServerPlugin : Plugin() {
             if (!completed) {
                 val entry = requestBridge.consume(requestId)
                 entry?.tempFile?.let { runCatching { it.delete() } }
+                // NanoHTTPD 2.3.1 does not expose 504 in Response.Status,
+                // so build a custom IStatus via HttpRequestBridge.statusOf.
                 return newFixedLengthResponse(
-                    Response.Status.GATEWAY_TIMEOUT,
+                    HttpRequestBridge.statusOf(504),
                     "text/plain",
                     "JS handler did not respond in time"
                 )
