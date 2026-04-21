@@ -1,6 +1,6 @@
 {
   "name": "@cantoo/capacitor-http-server",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Capacitor plugin exposing a local HTTP server on iOS and Android with routing delegated to JavaScript.",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
