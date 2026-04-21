@@ -145,14 +145,14 @@ deletes the temp file automatically once `respond()` returns.
 
 <docgen-index>
 
-- [`start(...)`](#start)
-- [`stop()`](#stop)
-- [`respond(...)`](#respond)
-- [`addListener('request', ...)`](#addlistenerrequest-)
-- [`addListener('server-error', ...)`](#addlistenerserver-error-)
-- [`removeAllListeners()`](#removealllisteners)
-- [Interfaces](#interfaces)
-- [Type Aliases](#type-aliases)
+* [`start(...)`](#start)
+* [`stop()`](#stop)
+* [`respond(...)`](#respond)
+* [`addListener('request', ...)`](#addlistenerrequest-)
+* [`addListener('server-error', ...)`](#addlistenerserver-error-)
+* [`removeAllListeners()`](#removealllisteners)
+* [Interfaces](#interfaces)
+* [Type Aliases](#type-aliases)
 
 </docgen-index>
 
@@ -176,7 +176,8 @@ or if required permissions are missing.
 
 **Returns:** <code>any</code>
 
----
+--------------------
+
 
 ### stop()
 
@@ -189,7 +190,8 @@ Safe to call when already stopped.
 
 **Returns:** <code>any</code>
 
----
+--------------------
+
 
 ### respond(...)
 
@@ -208,7 +210,8 @@ no-op on the second call. Unanswered requests time out (504) after 60 s.
 
 **Returns:** <code>any</code>
 
----
+--------------------
+
 
 ### addListener('request', ...)
 
@@ -227,7 +230,8 @@ event.
 
 **Returns:** <code>any</code>
 
----
+--------------------
+
 
 ### addListener('server-error', ...)
 
@@ -246,7 +250,8 @@ The server is considered dead when this fires with `fatal: true`.
 
 **Returns:** <code>any</code>
 
----
+--------------------
+
 
 ### removeAllListeners()
 
@@ -258,18 +263,21 @@ Remove every listener registered on this plugin.
 
 **Returns:** <code>any</code>
 
----
+--------------------
+
 
 ### Interfaces
+
 
 #### StartOptions
 
 | Prop                         | Type                                                                | Description                                                                                                                                                 |
 | ---------------------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **`port`**                   | <code>number</code>                                                 | If omitted or 0, the OS picks a free port in the dynamic range.                                                                                             |
-| **`maxBodyBytes`**           | <code>number</code>                                                 | Max request body size in bytes. Bodies above this return 413. Default: 50 _ 1024 _ 1024 (50 MB).                                                            |
-| **`fileBodyThresholdBytes`** | <code>number</code>                                                 | Threshold above which the plugin stores the body in a temp file and exposes it via `bodyFilePath` instead of `bodyBase64`. Default: 1 _ 1024 _ 1024 (1 MB). |
+| **`maxBodyBytes`**           | <code>number</code>                                                 | Max request body size in bytes. Bodies above this return 413. Default: 50 * 1024 * 1024 (50 MB).                                                            |
+| **`fileBodyThresholdBytes`** | <code>number</code>                                                 | Threshold above which the plugin stores the body in a temp file and exposes it via `bodyFilePath` instead of `bodyBase64`. Default: 1 * 1024 * 1024 (1 MB). |
 | **`android`**                | <code><a href="#startoptionsandroid">StartOptionsAndroid</a></code> | Android only. Title / text / small icon used by the foreground service notification (mandatory on Android 13+). Ignored on iOS.                             |
+
 
 #### StartOptionsAndroid
 
@@ -281,6 +289,7 @@ Remove every listener registered on this plugin.
 | **`channelId`**             | <code>string</code> | Notification channel ID. Plugin creates the channel if missing. |
 | **`channelName`**           | <code>string</code> | Notification channel display name.                              |
 
+
 #### StartResult
 
 | Prop          | Type                | Description                                                                    |
@@ -288,6 +297,7 @@ Remove every listener registered on this plugin.
 | **`port`**    | <code>number</code> | Chosen port (same as options.port when provided).                              |
 | **`url`**     | <code>string</code> | Full URL using the primary LAN IPv4 address, e.g. "http://192.168.1.42:49281". |
 | **`localIp`** | <code>string</code> | Primary LAN IPv4, or "127.0.0.1" if none could be detected.                    |
+
 
 #### HttpResponse
 
@@ -298,7 +308,9 @@ Remove every listener registered on this plugin.
 | **`headers`** | <code><a href="#httpheaders">HttpHeaders</a></code> | The headers received from the Http response.      |
 | **`url`**     | <code>string</code>                                 | The response URL received from the Http response. |
 
+
 #### HttpHeaders
+
 
 #### HttpRequestEvent
 
@@ -314,11 +326,13 @@ Remove every listener registered on this plugin.
 | **`bodyBase64`**   | <code>string</code>                               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | **`bodyFilePath`** | <code>string</code>                               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
+
 #### PluginListenerHandle
 
 | Prop         | Type                      |
 | ------------ | ------------------------- |
 | **`remove`** | <code>() =&gt; any</code> |
+
 
 #### ServerErrorEvent
 
@@ -327,7 +341,9 @@ Remove every listener registered on this plugin.
 | **`message`** | <code>string</code>  |                                                                    |
 | **`fatal`**   | <code>boolean</code> | True when the server is no longer listening and must be restarted. |
 
+
 ### Type Aliases
+
 
 #### HttpMethod
 

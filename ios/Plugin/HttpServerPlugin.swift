@@ -7,45 +7,59 @@ import Darwin
 @objc(HttpServerPlugin)
 public class HttpServerPlugin: CAPPlugin {
 
-    private let lock = NSLock()
+    private let stateLock = NSLock()
     private var webServer: GCDWebServer?
     private var currentPort: Int = 0
-    private var maxBodyBytes: Int = 50 * 1024 * 1024
-    private var fileBodyThresholdBytes: Int = 1 * 1024 * 1024
-    private let bridge = HttpRequestBridge()
+    private var maxBodyBytes: Int = HttpServerPlugin.defaultMaxBodyBytes
+    private var fileBodyThresholdBytes: Int = HttpServerPlugin.defaultFileBodyThreshold
+    private var isStarting: Bool = false
+    private var isStopping: Bool = false
+    private let requestBridge = HttpRequestBridge()
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    private var pendingBackgroundWork: DispatchWorkItem?
 
     private static let requestTimeout: TimeInterval = 60
+    private static let backgroundGraceSeconds: TimeInterval = 25
+    private static let defaultMaxBodyBytes: Int = 50 * 1024 * 1024
+    private static let defaultFileBodyThreshold: Int = 1 * 1024 * 1024
 
     // MARK: - Lifecycle
 
     @objc public override func load() {
-        NotificationCenter.default.addObserver(
+        let center = NotificationCenter.default
+        center.addObserver(
             self,
             selector: #selector(appWillResignActive),
             name: UIApplication.willResignActiveNotification,
             object: nil
         )
-        NotificationCenter.default.addObserver(
+        center.addObserver(
             self,
             selector: #selector(appDidEnterBackground),
             name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+        center.addObserver(
+            self,
+            selector: #selector(appWillEnterForeground),
+            name: UIApplication.willEnterForegroundNotification,
             object: nil
         )
     }
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+        pendingBackgroundWork?.cancel()
     }
 
     // MARK: - Plugin methods
 
     @objc func start(_ call: CAPPluginCall) {
-        lock.lock()
+        stateLock.lock()
         if webServer != nil {
             let port = currentPort
+            stateLock.unlock()
             let ip = localIPv4()
-            lock.unlock()
             call.resolve([
                 "port": port,
                 "url": "http://\(ip):\(port)",
@@ -53,9 +67,26 @@ public class HttpServerPlugin: CAPPlugin {
             ])
             return
         }
-        lock.unlock()
+        if isStarting {
+            stateLock.unlock()
+            call.reject("A concurrent start() call is already in progress")
+            return
+        }
+        isStarting = true
+        stateLock.unlock()
+
+        defer {
+            stateLock.lock()
+            isStarting = false
+            stateLock.unlock()
+        }
 
         let requestedPort = call.getInt("port") ?? 0
+
+        // Reset to defaults first so a start() call without options after a
+        // previous start({ maxBodyBytes: N }) does not inherit the old value.
+        self.maxBodyBytes = HttpServerPlugin.defaultMaxBodyBytes
+        self.fileBodyThresholdBytes = HttpServerPlugin.defaultFileBodyThreshold
         if let v = call.getInt("maxBodyBytes"), v > 0 {
             self.maxBodyBytes = v
         } else if let v = call.getDouble("maxBodyBytes"), v > 0 {
@@ -78,17 +109,20 @@ public class HttpServerPlugin: CAPPlugin {
             let server = GCDWebServer()
             installHandler(on: server)
 
+            // GCDWebServer reads these options as NSNumber via objectForKey, so
+            // wrap the primitives explicitly rather than relying on ObjC bridging.
             let options: [String: Any] = [
                 GCDWebServerOption_Port: NSNumber(value: port),
-                GCDWebServerOption_BindToLocalhost: false,
-                GCDWebServerOption_AutomaticallySuspendInBackground: false
+                GCDWebServerOption_BindToLocalhost: NSNumber(value: false),
+                GCDWebServerOption_AutomaticallySuspendInBackground: NSNumber(value: false)
             ]
             try server.start(options: options)
 
-            lock.lock()
+            stateLock.lock()
             self.webServer = server
             self.currentPort = Int(port)
-            lock.unlock()
+            self.isStopping = false
+            stateLock.unlock()
 
             let ip = localIPv4()
             call.resolve([
@@ -102,21 +136,27 @@ public class HttpServerPlugin: CAPPlugin {
     }
 
     @objc func stop(_ call: CAPPluginCall) {
-        lock.lock()
+        stateLock.lock()
         let server = webServer
         webServer = nil
         currentPort = 0
-        lock.unlock()
+        isStopping = true
+        let bgWork = pendingBackgroundWork
+        pendingBackgroundWork = nil
+        stateLock.unlock()
 
-        server?.stop()
-        server?.removeAllHandlers()
+        bgWork?.cancel()
 
-        // Drain pending requests with 503 so any still-blocked handler finishes.
-        let draining = GCDWebServerDataResponse(text: "Server stopping")
-        draining?.statusCode = 503
-        if let resp = draining {
-            bridge.drainAll(with: resp)
+        // Drain pending requests first so any worker blocked on the bridge
+        // is unblocked and GCDWebServer has nothing left in flight when we
+        // actually tear down the server.
+        if let draining = GCDWebServerDataResponse(text: "Server stopping") {
+            draining.statusCode = 503
+            requestBridge.drainAll(with: draining)
         }
+
+        server?.removeAllHandlers()
+        server?.stop()
 
         cleanupTempDir()
         endBackgroundTask()
@@ -151,19 +191,17 @@ public class HttpServerPlugin: CAPPlugin {
         let response: GCDWebServerResponse
         if let path = bodyFilePath {
             if !FileManager.default.fileExists(atPath: path) {
-                let err = GCDWebServerDataResponse(text: "Response file not found: \(path)")
-                err?.statusCode = 500
-                if let e = err {
-                    bridge.complete(requestId, with: e)
+                if let err = GCDWebServerDataResponse(text: "Response file not found: \(path)") {
+                    err.statusCode = 500
+                    requestBridge.complete(requestId, with: err)
                 }
                 call.resolve()
                 return
             }
             guard let fileResp = GCDWebServerFileResponse(file: path) else {
-                let err = GCDWebServerDataResponse(text: "Failed to open response file")
-                err?.statusCode = 500
-                if let e = err {
-                    bridge.complete(requestId, with: e)
+                if let err = GCDWebServerDataResponse(text: "Failed to open response file") {
+                    err.statusCode = 500
+                    requestBridge.complete(requestId, with: err)
                 }
                 call.resolve()
                 return
@@ -195,7 +233,7 @@ public class HttpServerPlugin: CAPPlugin {
             response.setValue(v, forAdditionalHeader: k)
         }
 
-        bridge.complete(requestId, with: response)
+        requestBridge.complete(requestId, with: response)
         call.resolve()
     }
 
@@ -204,7 +242,11 @@ public class HttpServerPlugin: CAPPlugin {
     private func installHandler(on server: GCDWebServer) {
         let matchBlock: GCDWebServerMatchBlock = { [weak self] method, url, headers, path, query in
             guard let self = self else { return nil }
-            let cl = Int(headers["Content-Length"] ?? "0") ?? 0
+            // HTTP header names are case-insensitive (RFC 7230); HTTP/2 clients
+            // send them lower-cased. The match block runs before the request
+            // object is built, so we cannot use request.contentLength here.
+            let rawCl = headers.first { $0.key.caseInsensitiveCompare("Content-Length") == .orderedSame }?.value
+            let cl = Int(rawCl ?? "0") ?? 0
             if cl > self.fileBodyThresholdBytes {
                 return GCDWebServerFileRequest(
                     method: method,
@@ -226,9 +268,12 @@ public class HttpServerPlugin: CAPPlugin {
 
         let asyncBlock: GCDWebServerAsyncProcessBlock = { [weak self] request, completion in
             guard let self = self else {
-                let resp = GCDWebServerDataResponse(text: "Server gone")
-                resp?.statusCode = 503
-                completion(resp)
+                if let resp = GCDWebServerDataResponse(text: "Server gone") {
+                    resp.statusCode = 503
+                    completion(resp)
+                } else {
+                    completion(nil)
+                }
                 return
             }
             self.handle(request: request, completion: completion)
@@ -238,13 +283,30 @@ public class HttpServerPlugin: CAPPlugin {
     }
 
     private func handle(request: GCDWebServerRequest, completion: @escaping (GCDWebServerResponse?) -> Void) {
+        // Short-circuit if stop() ran between accept and handler dispatch.
+        stateLock.lock()
+        let stopping = isStopping
+        stateLock.unlock()
+        if stopping {
+            if let resp = GCDWebServerDataResponse(text: "Server stopping") {
+                resp.statusCode = 503
+                completion(resp)
+            } else {
+                completion(nil)
+            }
+            return
+        }
+
         // Enforce the max body size declared at start(). GCDWebServer already
         // streams large uploads to disk for GCDWebServerFileRequest, so this
         // guard mainly rejects oversized payloads early.
         if Int(request.contentLength) > self.maxBodyBytes {
-            let r = GCDWebServerDataResponse(text: "Payload exceeds maxBodyBytes")
-            r?.statusCode = 413
-            completion(r)
+            if let r = GCDWebServerDataResponse(text: "Payload exceeds maxBodyBytes") {
+                r.statusCode = 413
+                completion(r)
+            } else {
+                completion(nil)
+            }
             return
         }
 
@@ -257,7 +319,6 @@ public class HttpServerPlugin: CAPPlugin {
         var bodyFilePath: String?
 
         if let fileRequest = request as? GCDWebServerFileRequest {
-            // GCDWebServer stored the upload in a temporary file we now own.
             let src = URL(fileURLWithPath: fileRequest.temporaryPath)
             let dst = self.tempDir().appendingPathComponent("req-\(requestId)")
             do {
@@ -266,7 +327,7 @@ public class HttpServerPlugin: CAPPlugin {
                 tempFile = dst
                 bodyFilePath = dst.path
             } catch {
-                // Fall back to reading from the original path (GCDWebServer will clean it up later).
+                // GCDWebServer will eventually clean up src; use it as-is.
                 tempFile = src
                 bodyFilePath = src.path
             }
@@ -294,20 +355,24 @@ public class HttpServerPlugin: CAPPlugin {
         if let v = bodyBase64 { event["bodyBase64"] = v }
         if let v = bodyFilePath { event["bodyFilePath"] = v }
 
+        let capturedTempFile = tempFile
         let timeoutWork = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
-            guard self.bridge.consume(requestId) != nil else { return }
-            if let f = tempFile { try? FileManager.default.removeItem(at: f) }
-            let r = GCDWebServerDataResponse(text: "JS handler did not respond in time")
-            r?.statusCode = 504
-            completion(r)
+            guard self.requestBridge.consume(requestId) != nil else { return }
+            if let f = capturedTempFile { try? FileManager.default.removeItem(at: f) }
+            if let r = GCDWebServerDataResponse(text: "JS handler did not respond in time") {
+                r.statusCode = 504
+                completion(r)
+            } else {
+                completion(nil)
+            }
         }
         DispatchQueue.global(qos: .utility).asyncAfter(
             deadline: .now() + HttpServerPlugin.requestTimeout,
             execute: timeoutWork
         )
 
-        bridge.register(
+        requestBridge.register(
             requestId,
             entry: HttpRequestBridge.Pending(
                 completion: { response in completion(response) },
@@ -316,6 +381,25 @@ public class HttpServerPlugin: CAPPlugin {
             )
         )
 
+        // Re-check after register: if stop() ran between the pre-check and
+        // here, the drainAll snapshot would have missed us and we'd hang 60s.
+        stateLock.lock()
+        let stoppingNow = isStopping
+        stateLock.unlock()
+        if stoppingNow {
+            if let entry = requestBridge.consume(requestId) {
+                entry.timeoutWork.cancel()
+                if let f = entry.tempFile { try? FileManager.default.removeItem(at: f) }
+                if let r = GCDWebServerDataResponse(text: "Server stopping") {
+                    r.statusCode = 503
+                    completion(r)
+                } else {
+                    completion(nil)
+                }
+            }
+            return
+        }
+
         self.notifyListeners("request", data: event)
     }
 
@@ -323,32 +407,57 @@ public class HttpServerPlugin: CAPPlugin {
 
     @objc private func appWillResignActive() {
         // Ask the system for a short background execution window so we can
-        // honor in-flight requests before iOS suspends the process. This is
-        // best-effort only; iOS does not permit long-running HTTP servers in
-        // background. The consumer is expected to treat background as
-        // "server is dead" and restart on foreground.
+        // honour in-flight requests before iOS suspends the process. Best
+        // effort only; iOS does not permit long-running HTTP servers in
+        // background. Consumers should treat background as "server is dead"
+        // and restart on foreground.
         beginBackgroundTask()
     }
 
     @objc private func appDidEnterBackground() {
-        // Give the app ~25 s to finish pending requests, then notify JS that
-        // the server has been stopped by the system.
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 25) { [weak self] in
+        stateLock.lock()
+        let stalePending = pendingBackgroundWork
+        pendingBackgroundWork = nil
+        let hasServer = webServer != nil
+        stateLock.unlock()
+
+        stalePending?.cancel()
+        guard hasServer else { return }
+
+        let work = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
-            self.lock.lock()
-            let hasServer = self.webServer != nil
-            self.lock.unlock()
-            if hasServer {
-                self.notifyListeners(
-                    "server-error",
-                    data: [
-                        "message": "App moved to background; iOS will suspend the HTTP server.",
-                        "fatal": true
-                    ]
-                )
-            }
+            self.stateLock.lock()
+            let stillRunning = self.webServer != nil
+            let stillScheduled = self.pendingBackgroundWork != nil
+            self.stateLock.unlock()
+            guard stillRunning, stillScheduled else { return }
+            self.notifyListeners(
+                "server-error",
+                data: [
+                    "message": "App moved to background; iOS is suspending the HTTP server.",
+                    "fatal": true
+                ]
+            )
             self.endBackgroundTask()
         }
+
+        stateLock.lock()
+        pendingBackgroundWork = work
+        stateLock.unlock()
+
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + HttpServerPlugin.backgroundGraceSeconds,
+            execute: work
+        )
+    }
+
+    @objc private func appWillEnterForeground() {
+        stateLock.lock()
+        let work = pendingBackgroundWork
+        pendingBackgroundWork = nil
+        stateLock.unlock()
+        work?.cancel()
+        endBackgroundTask()
     }
 
     private func beginBackgroundTask() {
@@ -402,23 +511,11 @@ public class HttpServerPlugin: CAPPlugin {
         return result
     }
 
-    private func parseQuery(_ raw: String?) -> [String: String] {
-        guard let raw = raw, !raw.isEmpty else { return [:] }
-        var result: [String: String] = [:]
-        for pair in raw.split(separator: "&") {
-            let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-            let key = parts.first.map(String.init) ?? ""
-            let value = parts.count > 1 ? String(parts[1]) : ""
-            let k = key.removingPercentEncoding ?? key
-            let v = value.removingPercentEncoding ?? value
-            result[k] = v
-        }
-        return result
-    }
-
     private func pickFreePort() throws -> UInt16 {
         let s = socket(AF_INET, SOCK_STREAM, 0)
-        if s < 0 { throw NSError(domain: "HttpServer", code: 1, userInfo: [NSLocalizedDescriptionKey: "socket() failed"]) }
+        if s < 0 {
+            throw NSError(domain: "HttpServer", code: 1, userInfo: [NSLocalizedDescriptionKey: "socket() failed"])
+        }
         defer { close(s) }
 
         var yes: Int32 = 1

@@ -2,13 +2,10 @@ package com.cantooscribe.httpserver
 
 import android.Manifest
 import android.content.Context
-import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.util.Base64
 import android.util.Log
-import androidx.core.content.ContextCompat
-import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
 import com.getcapacitor.PermissionState
 import com.getcapacitor.Plugin
@@ -32,8 +29,6 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import org.json.JSONArray
-import org.json.JSONObject
 
 @CapacitorPlugin(
     name = "HttpServer",
@@ -46,14 +41,17 @@ import org.json.JSONObject
 )
 class HttpServerPlugin : Plugin() {
 
-    private val lock = Any()
+    private val stateLock = Any()
 
     @Volatile private var server: LocalHttpServer? = null
     @Volatile private var currentPort: Int = 0
+    @Volatile private var isStarting: Boolean = false
+    @Volatile private var isStopping: Boolean = false
     @Volatile private var maxBodyBytes: Long = DEFAULT_MAX_BODY
     @Volatile private var fileBodyThresholdBytes: Long = DEFAULT_FILE_THRESHOLD
 
-    private val bridge = HttpRequestBridge()
+    /** Renamed from `bridge` to avoid shadowing `Plugin.bridge` (the Capacitor Bridge). */
+    private val requestBridge = HttpRequestBridge()
 
     /** Pending start() call parked while we request POST_NOTIFICATIONS. */
     private var parkedStartCall: PluginCall? = null
@@ -68,21 +66,21 @@ class HttpServerPlugin : Plugin() {
 
     @PluginMethod
     fun start(call: PluginCall) {
-        synchronized(lock) {
-            server?.let { existing ->
-                val result = JSObject().apply {
-                    put("port", currentPort)
-                    put("url", buildUrl(localIp(), currentPort))
-                    put("localIp", localIp())
-                }
-                call.resolve(result)
+        synchronized(stateLock) {
+            if (server != null) {
+                call.resolve(currentResult())
                 return
             }
+            if (isStarting) {
+                call.reject("A concurrent start() call is already in progress")
+                return
+            }
+            isStarting = true
         }
 
         // Request POST_NOTIFICATIONS on API 33+ because the foreground service
         // notification is required. We still start the server if denied, but
-        // we emit a warning in the log so the consumer is aware.
+        // we log a warning so the consumer is aware.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val state = getPermissionState("notifications")
             if (state != PermissionState.GRANTED) {
@@ -111,69 +109,95 @@ class HttpServerPlugin : Plugin() {
     }
 
     private fun doStart(call: PluginCall) {
-        val requestedPort = call.getInt("port") ?: 0
-        maxBodyBytes = call.getLong("maxBodyBytes") ?: DEFAULT_MAX_BODY
-        fileBodyThresholdBytes = call.getLong("fileBodyThresholdBytes") ?: DEFAULT_FILE_THRESHOLD
+        try {
+            val requestedPort = call.getInt("port") ?: 0
+            maxBodyBytes = call.getLong("maxBodyBytes") ?: DEFAULT_MAX_BODY
+            fileBodyThresholdBytes = call.getLong("fileBodyThresholdBytes") ?: DEFAULT_FILE_THRESHOLD
 
-        val androidOpts = call.getObject("android")
-        val notifTitle = androidOpts?.getString("notificationTitle") ?: "HTTP server running"
-        val notifText = androidOpts?.getString("notificationText") ?: ""
-        val channelId = androidOpts?.getString("channelId")
-        val channelName = androidOpts?.getString("channelName")
-        val smallIcon = androidOpts?.getString("smallIconResourceName")
+            val androidOpts = call.getObject("android")
+            val notifTitle = androidOpts?.getString("notificationTitle") ?: "HTTP server running"
+            val notifText = androidOpts?.getString("notificationText") ?: ""
+            val channelId = androidOpts?.getString("channelId")
+            val channelName = androidOpts?.getString("channelName")
+            val smallIcon = androidOpts?.getString("smallIconResourceName")
 
-        synchronized(lock) {
-            if (server != null) {
-                val result = JSObject().apply {
-                    put("port", currentPort)
-                    put("url", buildUrl(localIp(), currentPort))
-                    put("localIp", localIp())
+            synchronized(stateLock) {
+                if (server != null) {
+                    call.resolve(currentResult())
+                    return
                 }
-                call.resolve(result)
-                return
+                try {
+                    val port = if (requestedPort > 0) requestedPort else pickFreePort()
+                    val srv = LocalHttpServer(port)
+                    srv.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
+                    server = srv
+                    currentPort = port
+                    isStopping = false
+                } catch (e: Throwable) {
+                    call.reject("Failed to start server: ${e.message}", e)
+                    return
+                }
             }
 
+            // startForegroundService can throw ForegroundServiceStartNotAllowedException
+            // (API 31+) when the host app is not in the foreground. In that case
+            // the NanoHTTPD socket is already listening, so we must tear it down
+            // before rejecting — otherwise the port stays taken and the JS
+            // promise is left in a lying state.
             try {
-                val port = if (requestedPort > 0) requestedPort else pickFreePort()
-                val srv = LocalHttpServer(port)
-                srv.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
-                server = srv
-                currentPort = port
+                HttpServerService.start(
+                    appContext(),
+                    notifTitle,
+                    notifText,
+                    channelId,
+                    channelName,
+                    smallIcon
+                )
             } catch (e: Throwable) {
-                call.reject("Failed to start server: ${e.message}", e)
+                val srv: LocalHttpServer?
+                synchronized(stateLock) {
+                    srv = server
+                    server = null
+                    currentPort = 0
+                    isStopping = true
+                }
+                // A client may have connected in the tiny window between
+                // srv.start() and HttpServerService.start(). Drain first so
+                // any worker already parked on the latch wakes up, otherwise
+                // it would block for the full 60 s request timeout.
+                requestBridge.drain(
+                    HttpRequestBridge.PendingResponse(
+                        status = 503,
+                        headers = mapOf("content-type" to "text/plain; charset=utf-8"),
+                        bodyText = "Server stopping",
+                        bodyBase64 = null,
+                        bodyFilePath = null
+                    )
+                )
+                try { srv?.stop() } catch (_: Throwable) {}
+                call.reject("Failed to start foreground service: ${e.message}", e)
                 return
             }
-        }
 
-        HttpServerService.start(
-            appContext(),
-            notifTitle,
-            notifText,
-            channelId,
-            channelName,
-            smallIcon
-        )
-
-        val result = JSObject().apply {
-            put("port", currentPort)
-            put("url", buildUrl(localIp(), currentPort))
-            put("localIp", localIp())
+            call.resolve(currentResult())
+        } finally {
+            synchronized(stateLock) { isStarting = false }
         }
-        call.resolve(result)
     }
 
     @PluginMethod
     fun stop(call: PluginCall) {
-        synchronized(lock) {
-            val srv = server
+        val srv: LocalHttpServer?
+        synchronized(stateLock) {
+            srv = server
             server = null
-            if (srv != null) {
-                try { srv.stop() } catch (_: Throwable) {}
-            }
+            currentPort = 0
+            isStopping = true
         }
 
-        // Drain pending requests with 503 so the waiting HTTP threads unblock.
-        bridge.drain(
+        // Drain pending requests first so blocked worker threads unblock
+        // before we tear down the underlying socket.
+        requestBridge.drain(
             HttpRequestBridge.PendingResponse(
                 status = 503,
                 headers = mapOf("content-type" to "text/plain; charset=utf-8"),
@@ -182,6 +206,10 @@ class HttpServerPlugin : Plugin() {
                 bodyFilePath = null
             )
         )
+
+        if (srv != null) {
+            try { srv.stop() } catch (_: Throwable) {}
+        }
 
         HttpServerService.stop(appContext())
         cleanupTempDir()
@@ -216,20 +244,32 @@ class HttpServerPlugin : Plugin() {
             bodyBase64 = bodyBase64,
             bodyFilePath = bodyFilePath
         )
-        bridge.complete(requestId, response)
+        requestBridge.complete(requestId, response)
         call.resolve()
     }
 
     override fun handleOnDestroy() {
-        try {
-            server?.stop()
-        } catch (_: Throwable) {}
-        server = null
-        bridge.drain(null)
+        val srv: LocalHttpServer?
+        synchronized(stateLock) {
+            srv = server
+            server = null
+            isStopping = true
+        }
+        requestBridge.drain(null)
+        try { srv?.stop() } catch (_: Throwable) {}
         HttpServerService.stop(appContext())
     }
 
     // ---------- Internals ----------
+
+    private fun currentResult(): JSObject {
+        val ip = localIp()
+        return JSObject().apply {
+            put("port", currentPort)
+            put("url", buildUrl(ip, currentPort))
+            put("localIp", ip)
+        }
+    }
 
     private fun cleanupTempDir() {
         try {
@@ -240,19 +280,18 @@ class HttpServerPlugin : Plugin() {
     private fun buildUrl(ip: String, port: Int): String = "http://$ip:$port"
 
     private fun pickFreePort(): Int {
-        val socket = ServerSocket(0)
-        try {
+        ServerSocket(0).use { socket ->
             socket.reuseAddress = true
             return socket.localPort
-        } finally {
-            try { socket.close() } catch (_: Throwable) {}
         }
     }
 
     private fun localIp(): String {
         try {
+            @Suppress("DEPRECATION")
             val wifi = appContext().applicationContext
                 .getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            @Suppress("DEPRECATION")
             val raw = wifi?.connectionInfo?.ipAddress ?: 0
             if (raw != 0) {
                 val bytes = byteArrayOf(
@@ -296,7 +335,7 @@ class HttpServerPlugin : Plugin() {
         override fun serve(session: IHTTPSession): Response {
             return try {
                 handle(session)
-            } catch (oom: OutOfMemoryError) {
+            } catch (_: OutOfMemoryError) {
                 emitServerError("Out of memory while serving request", false)
                 newFixedLengthResponse(
                     Response.Status.INTERNAL_ERROR,
@@ -314,6 +353,14 @@ class HttpServerPlugin : Plugin() {
         }
 
         private fun handle(session: IHTTPSession): Response {
+            if (isStopping) {
+                return newFixedLengthResponse(
+                    Response.Status.SERVICE_UNAVAILABLE,
+                    "text/plain",
+                    "Server stopping"
+                )
+            }
+
             val headers = session.headers // NanoHTTPD already lower-cases header names.
 
             val transferEncoding = headers["transfer-encoding"]
@@ -365,7 +412,6 @@ class HttpServerPlugin : Plugin() {
                         bodyText = try {
                             String(buf, Charsets.UTF_8)
                         } catch (_: Throwable) {
-                            Base64.encodeToString(buf, Base64.NO_WRAP).also { bodyBase64 = it }
                             null
                         }
                         if (bodyText == null) bodyBase64 = Base64.encodeToString(buf, Base64.NO_WRAP)
@@ -390,7 +436,7 @@ class HttpServerPlugin : Plugin() {
             val latch = CountDownLatch(1)
             val holder = arrayOf<HttpRequestBridge.PendingResponse?>(null)
 
-            bridge.register(
+            requestBridge.register(
                 requestId,
                 HttpRequestBridge.Pending(
                     responder = { resp ->
@@ -400,12 +446,25 @@ class HttpServerPlugin : Plugin() {
                     tempFile = tempFile
                 )
             )
+
+            // stop() may have drained the bridge *before* we registered; in
+            // that case we'd block for 60 s waiting for a response that will
+            // never come. Re-check and unregister eagerly if so.
+            if (isStopping) {
+                val entry = requestBridge.consume(requestId)
+                entry?.tempFile?.let { runCatching { it.delete() } }
+                return newFixedLengthResponse(
+                    Response.Status.SERVICE_UNAVAILABLE,
+                    "text/plain",
+                    "Server stopping"
+                )
+            }
+
             notifyListeners("request", event)
 
             val completed = latch.await(REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             if (!completed) {
-                // Timeout - consume entry (if still there) and clean up.
-                val entry = bridge.consume(requestId)
+                val entry = requestBridge.consume(requestId)
                 entry?.tempFile?.let { runCatching { it.delete() } }
                 return newFixedLengthResponse(
                     Response.Status.GATEWAY_TIMEOUT,
@@ -456,7 +515,7 @@ class HttpServerPlugin : Plugin() {
                 }
             }
 
-            // Apply custom headers (skip content-type/length which NanoHTTPD manages).
+            // Skip content-type/length/transfer-encoding: NanoHTTPD owns these.
             for ((k, v) in resp.headers) {
                 when (k.lowercase(Locale.ROOT)) {
                     "content-type", "content-length", "transfer-encoding" -> continue
@@ -525,40 +584,6 @@ class HttpServerPlugin : Plugin() {
             obj.put(k.lowercase(Locale.ROOT), v)
         }
         return obj
-    }
-
-    @Suppress("UNUSED_PARAMETER")
-    private fun jsArray(items: List<String>): JSArray {
-        val arr = JSArray()
-        for (s in items) arr.put(s)
-        return arr
-    }
-
-    @Suppress("UNUSED_PARAMETER")
-    private fun toJSObject(json: JSONObject): JSObject {
-        val result = JSObject()
-        val keys = json.keys()
-        while (keys.hasNext()) {
-            val key = keys.next()
-            result.put(key, json.get(key))
-        }
-        return result
-    }
-
-    @Suppress("UNUSED_PARAMETER")
-    private fun toJSArray(arr: JSONArray): JSArray {
-        val result = JSArray()
-        for (i in 0 until arr.length()) result.put(arr.get(i))
-        return result
-    }
-
-    @Suppress("unused")
-    private fun hasNotificationPermission(): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true
-        return ContextCompat.checkSelfPermission(
-            appContext(),
-            Manifest.permission.POST_NOTIFICATIONS
-        ) == PackageManager.PERMISSION_GRANTED
     }
 
     companion object {
