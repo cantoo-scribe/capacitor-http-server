@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+.gradle/
+*.log
+.DS_Store
+.idea/
+.vscode/
+Pods/
+Podfile.lock
+xcuserdata/
+*.xcworkspace
+android/build/
+android/.gradle/
+android/local.properties

@@ -1,0 +1,23 @@
+{
+  "git": {
+    "requireCleanWorkingDir": true,
+    "requireUpstream": true,
+    "requireBranch": "master",
+    "commitMessage": "chore: release v${version}",
+    "tagName": "v${version}",
+    "tagAnnotation": "Release v${version}",
+    "push": true
+  },
+  "github": {
+    "release": true,
+    "releaseName": "v${version}"
+  },
+  "npm": {
+    "publish": true,
+    "publishPath": ".",
+    "skipChecks": false
+  },
+  "hooks": {
+    "before:init": ["npm run typecheck", "npm run build"]
+  }
+}

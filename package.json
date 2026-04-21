@@ -1,0 +1,88 @@
+{
+  "name": "@cantoo/capacitor-http-server",
+  "version": "0.1.0",
+  "description": "Capacitor plugin exposing a local HTTP server on iOS and Android with routing delegated to JavaScript.",
+  "main": "dist/plugin.cjs.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/esm/index.d.ts",
+  "unpkg": "dist/plugin.js",
+  "files": [
+    "android/src/main/",
+    "android/build.gradle",
+    "dist/",
+    "ios/Plugin/",
+    "ios/Package.swift",
+    "CapacitorHttpServer.podspec"
+  ],
+  "author": "Cantoo Scribe",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sharcoux/capacitor-http-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Sharcoux/capacitor-http-server/issues"
+  },
+  "homepage": "https://github.com/Sharcoux/capacitor-http-server#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "capacitor",
+    "plugin",
+    "http",
+    "server",
+    "native",
+    "ios",
+    "android"
+  ],
+  "scripts": {
+    "lint": "npm run eslint && npm run prettier -- --check",
+    "fmt": "npm run eslint -- --fix && npm run prettier -- --write",
+    "eslint": "eslint . --ext .ts",
+    "prettier": "prettier \"**/*.{ts,js,mjs,md,json}\"",
+    "docgen": "docgen --api HttpServerPlugin --output-readme README.md --output-json dist/docs.json",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run clean && npm run docgen && tsc && rollup -c rollup.config.mjs",
+    "clean": "rimraf ./dist",
+    "watch": "tsc --watch",
+    "release": "npm run typecheck && npm run build && release-it",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@capacitor/core": "^7.0.0",
+    "@capacitor/docgen": "^0.3.0",
+    "@ionic/eslint-config": "^0.4.0",
+    "@ionic/prettier-config": "^4.0.0",
+    "eslint": "^8.57.0",
+    "prettier": "^3.3.0",
+    "release-it": "^17.10.0",
+    "rimraf": "^6.0.0",
+    "rollup": "^4.20.0",
+    "typescript": "^5.5.0"
+  },
+  "peerDependencies": {
+    "@capacitor/core": "^6.0.0 || ^7.0.0 || ^8.0.0"
+  },
+  "prettier": "@ionic/prettier-config",
+  "eslintConfig": {
+    "extends": "@ionic/eslint-config/recommended",
+    "rules": {
+      "@typescript-eslint/no-unused-vars": [
+        "warn",
+        {
+          "argsIgnorePattern": "^_",
+          "varsIgnorePattern": "^_"
+        }
+      ]
+    }
+  },
+  "capacitor": {
+    "ios": {
+      "src": "ios"
+    },
+    "android": {
+      "src": "android"
+    }
+  }
+}
