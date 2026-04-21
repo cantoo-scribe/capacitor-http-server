@@ -18,12 +18,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Sharcoux/capacitor-http-server.git"
+    "url": "git+https://github.com/cantoo-scribe/capacitor-http-server.git"
   },
   "bugs": {
-    "url": "https://github.com/Sharcoux/capacitor-http-server/issues"
+    "url": "https://github.com/cantoo-scribe/capacitor-http-server/issues"
   },
-  "homepage": "https://github.com/Sharcoux/capacitor-http-server#readme",
+  "homepage": "https://github.com/cantoo-scribe/capacitor-http-server#readme",
   "publishConfig": {
     "access": "public"
   },
