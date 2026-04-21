@@ -3,14 +3,14 @@ import PackageDescription
 
 // Swift Package Manager manifest used only for local development and testing
 // of the plugin sources. Consumers install the plugin via CocoaPods using
-// `CapacitorHttpServer.podspec` at the repository root.
+// `CantooCapacitorHttpServer.podspec` at the repository root.
 let package = Package(
-    name: "CapacitorHttpServer",
+    name: "CantooCapacitorHttpServer",
     platforms: [.iOS(.v13)],
     products: [
         .library(
-            name: "CapacitorHttpServer",
-            targets: ["CapacitorHttpServer"]
+            name: "CantooCapacitorHttpServer",
+            targets: ["CantooCapacitorHttpServer"]
         )
     ],
     dependencies: [
@@ -19,7 +19,7 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "CapacitorHttpServer",
+            name: "CantooCapacitorHttpServer",
             dependencies: [
                 .product(name: "Capacitor", package: "capacitor-swift-pm"),
                 .product(name: "Cordova", package: "capacitor-swift-pm"),
