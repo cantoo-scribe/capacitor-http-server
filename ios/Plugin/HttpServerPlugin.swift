@@ -300,7 +300,17 @@ public class HttpServerPlugin: CAPPlugin {
         // Enforce the max body size declared at start(). GCDWebServer already
         // streams large uploads to disk for GCDWebServerFileRequest, so this
         // guard mainly rejects oversized payloads early.
-        if Int(request.contentLength) > self.maxBodyBytes {
+        //
+        // GCDWebServerRequest.contentLength is NSUInteger and is imported in
+        // Swift as UInt. GCDWebServer sets it to NSUIntegerMax (= UInt.max)
+        // when the request has no Content-Length header (e.g. every GET), so
+        // we must NOT convert to Int here — Int(UInt.max) traps with
+        // "Not enough bits to represent the passed value". Compare in UInt
+        // and treat the sentinel as a zero-length body.
+        let rawContentLength = request.contentLength
+        let declaredBodyLength: UInt = rawContentLength == UInt.max ? 0 : rawContentLength
+        let limit = self.maxBodyBytes >= 0 ? UInt(self.maxBodyBytes) : 0
+        if declaredBodyLength > limit {
             if let r = GCDWebServerDataResponse(text: "Payload exceeds maxBodyBytes") {
                 r.statusCode = 413
                 completion(r)

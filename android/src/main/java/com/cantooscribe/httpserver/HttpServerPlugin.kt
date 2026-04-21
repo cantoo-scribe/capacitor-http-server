@@ -111,8 +111,15 @@ class HttpServerPlugin : Plugin() {
     private fun doStart(call: PluginCall) {
         try {
             val requestedPort = call.getInt("port") ?: 0
-            maxBodyBytes = call.getLong("maxBodyBytes") ?: DEFAULT_MAX_BODY
-            fileBodyThresholdBytes = call.getLong("fileBodyThresholdBytes") ?: DEFAULT_FILE_THRESHOLD
+            // PluginCall.getLong requires the underlying JSON value to be a
+            // java.lang.Long, but Android's JSONObject stores JS numbers that
+            // fit in int range as java.lang.Integer. Routing through getDouble
+            // handles Integer/Long/Double uniformly and avoids silently
+            // ignoring user-supplied values like `{ maxBodyBytes: 10_000_000 }`.
+            maxBodyBytes = call.getDouble("maxBodyBytes")?.toLong()?.takeIf { it > 0 }
+                ?: DEFAULT_MAX_BODY
+            fileBodyThresholdBytes = call.getDouble("fileBodyThresholdBytes")?.toLong()?.takeIf { it > 0 }
+                ?: DEFAULT_FILE_THRESHOLD
 
             val androidOpts = call.getObject("android")
             val notifTitle = androidOpts?.getString("notificationTitle") ?: "HTTP server running"
