@@ -2,7 +2,6 @@ package com.cantooscribe.httpserver
 
 import android.Manifest
 import android.content.Context
-import android.net.wifi.WifiManager
 import android.os.Build
 import android.util.Base64
 import android.util.Log
@@ -21,7 +20,6 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.Inet4Address
-import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.URLDecoder
@@ -66,16 +64,25 @@ class HttpServerPlugin : Plugin() {
 
     @PluginMethod
     fun start(call: PluginCall) {
+        val serverAlreadyRunning: Boolean
         synchronized(stateLock) {
-            if (server != null) {
-                call.resolve(currentResult())
-                return
+            when {
+                server != null -> serverAlreadyRunning = true
+                isStarting -> {
+                    call.reject("A concurrent start() call is already in progress")
+                    return
+                }
+                else -> {
+                    serverAlreadyRunning = false
+                    isStarting = true
+                }
             }
-            if (isStarting) {
-                call.reject("A concurrent start() call is already in progress")
-                return
-            }
-            isStarting = true
+        }
+        if (serverAlreadyRunning) {
+            val ip = localIp()
+            if (ip.isEmpty()) emitNoLanInterfaceWarning()
+            call.resolve(currentResult(ip))
+            return
         }
 
         // Request POST_NOTIFICATIONS on API 33+ because the foreground service
@@ -128,27 +135,34 @@ class HttpServerPlugin : Plugin() {
             val channelName = androidOpts?.getString("channelName")
             val smallIcon = androidOpts?.getString("smallIconResourceName")
 
+            var serverAlreadyRunning = false
             synchronized(stateLock) {
                 if (server != null) {
-                    call.resolve(currentResult())
-                    return
+                    serverAlreadyRunning = true
+                } else {
+                    try {
+                        val port = if (requestedPort > 0) requestedPort else pickFreePort()
+                        val srv = LocalHttpServer(port)
+                        srv.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
+                        server = srv
+                        currentPort = port
+                        isStopping = false
+                    } catch (e: Throwable) {
+                        // PluginCall.reject(String, Exception) cannot accept a raw
+                        // Throwable, so wrap errors (OOM, etc.) in an Exception.
+                        call.reject(
+                            "Failed to start server: ${e.message}",
+                            e as? Exception ?: RuntimeException(e)
+                        )
+                        return
+                    }
                 }
-                try {
-                    val port = if (requestedPort > 0) requestedPort else pickFreePort()
-                    val srv = LocalHttpServer(port)
-                    srv.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
-                    server = srv
-                    currentPort = port
-                    isStopping = false
-                } catch (e: Throwable) {
-                    // PluginCall.reject(String, Exception) cannot accept a raw
-                    // Throwable, so wrap errors (OOM, etc.) in an Exception.
-                    call.reject(
-                        "Failed to start server: ${e.message}",
-                        e as? Exception ?: RuntimeException(e)
-                    )
-                    return
-                }
+            }
+            if (serverAlreadyRunning) {
+                val ip = localIp()
+                if (ip.isEmpty()) emitNoLanInterfaceWarning()
+                call.resolve(currentResult(ip))
+                return
             }
 
             // startForegroundService can throw ForegroundServiceStartNotAllowedException
@@ -194,7 +208,9 @@ class HttpServerPlugin : Plugin() {
                 return
             }
 
-            call.resolve(currentResult())
+            val ip = localIp()
+            if (ip.isEmpty()) emitNoLanInterfaceWarning()
+            call.resolve(currentResult(ip))
         } finally {
             synchronized(stateLock) { isStarting = false }
         }
@@ -285,8 +301,7 @@ class HttpServerPlugin : Plugin() {
 
     // ---------- Internals ----------
 
-    private fun currentResult(): JSObject {
-        val ip = localIp()
+    private fun currentResult(ip: String): JSObject {
         return JSObject().apply {
             put("port", currentPort)
             put("url", buildUrl(ip, currentPort))
@@ -300,7 +315,8 @@ class HttpServerPlugin : Plugin() {
         } catch (_: Throwable) {}
     }
 
-    private fun buildUrl(ip: String, port: Int): String = "http://$ip:$port"
+    private fun buildUrl(ip: String, port: Int): String =
+        if (ip.isEmpty()) "" else "http://$ip:$port"
 
     private fun pickFreePort(): Int {
         ServerSocket(0).use { socket ->
@@ -310,37 +326,56 @@ class HttpServerPlugin : Plugin() {
     }
 
     private fun localIp(): String {
+        val candidates = mutableListOf<Pair<Int, String>>() // (score, ip)
         try {
-            @Suppress("DEPRECATION")
-            val wifi = appContext().applicationContext
-                .getSystemService(Context.WIFI_SERVICE) as? WifiManager
-            @Suppress("DEPRECATION")
-            val raw = wifi?.connectionInfo?.ipAddress ?: 0
-            if (raw != 0) {
-                val bytes = byteArrayOf(
-                    (raw and 0xff).toByte(),
-                    (raw shr 8 and 0xff).toByte(),
-                    (raw shr 16 and 0xff).toByte(),
-                    (raw shr 24 and 0xff).toByte()
-                )
-                val addr = InetAddress.getByAddress(bytes).hostAddress
-                if (!addr.isNullOrEmpty() && addr != "0.0.0.0") return addr
-            }
-        } catch (_: Throwable) { /* fall through */ }
-
-        try {
-            val ifaces = NetworkInterface.getNetworkInterfaces() ?: return "127.0.0.1"
+            val ifaces = NetworkInterface.getNetworkInterfaces() ?: return ""
             for (iface in ifaces) {
                 if (!iface.isUp || iface.isLoopback || iface.isVirtual) continue
+                val name = iface.name?.lowercase(Locale.ROOT) ?: continue
                 for (addr in iface.inetAddresses) {
-                    if (addr is Inet4Address && !addr.isLoopbackAddress && !addr.isLinkLocalAddress) {
-                        return addr.hostAddress ?: continue
-                    }
+                    if (addr !is Inet4Address) continue
+                    if (addr.isLoopbackAddress || addr.isLinkLocalAddress) continue
+                    val host = addr.hostAddress ?: continue
+                    val score = scoreInterface(name, host)
+                    if (score > 0) candidates += score to host
                 }
             }
-        } catch (_: Throwable) { /* ignore */ }
+        } catch (_: Throwable) {
+            return ""
+        }
+        return candidates.maxByOrNull { it.first }?.second ?: ""
+    }
 
-        return "127.0.0.1"
+    private fun scoreInterface(name: String, ipv4: String): Int {
+        val cellularPrefixes = listOf("rmnet", "ccmni", "wwan", "pdp_ip", "tun", "dun")
+        if (cellularPrefixes.any { name.startsWith(it) }) return 0
+        if (name == "wlan0" || name == "en0" || name == "en1") return 100
+        if (name.matches(Regex("^eth[0-9]+$"))) return 90
+        if (name.startsWith("ap") || name.startsWith("softap") ||
+            name.startsWith("swlan") || name.startsWith("tether") ||
+            name == "wlan1"
+        ) {
+            return 80
+        }
+        if (isRfc1918(ipv4)) return 50
+        return 10
+    }
+
+    private fun isRfc1918(ipv4: String): Boolean {
+        val parts = ipv4.split('.').mapNotNull { it.toIntOrNull() }
+        if (parts.size != 4) return false
+        val (a, b) = parts[0] to parts[1]
+        return a == 10 ||
+            (a == 172 && b in 16..31) ||
+            (a == 192 && b == 168)
+    }
+
+    private fun emitNoLanInterfaceWarning() {
+        emitServerError(
+            "No reachable LAN interface (Wi-Fi off, Ethernet absent, " +
+                "hotspot inactive). Server is listening but cannot be reached.",
+            false
+        )
     }
 
     private fun emitServerError(message: String, fatal: Boolean) {

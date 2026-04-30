@@ -60,9 +60,12 @@ public class HttpServerPlugin: CAPPlugin {
             let port = currentPort
             stateLock.unlock()
             let ip = localIPv4()
+            if ip.isEmpty {
+                emitNoLanInterfaceWarning()
+            }
             call.resolve([
                 "port": port,
-                "url": "http://\(ip):\(port)",
+                "url": buildStartUrl(ip: ip, port: port),
                 "localIp": ip
             ])
             return
@@ -125,9 +128,12 @@ public class HttpServerPlugin: CAPPlugin {
             stateLock.unlock()
 
             let ip = localIPv4()
+            if ip.isEmpty {
+                emitNoLanInterfaceWarning()
+            }
             call.resolve([
                 "port": Int(port),
-                "url": "http://\(ip):\(port)",
+                "url": buildStartUrl(ip: ip, port: Int(port)),
                 "localIp": ip
             ])
         } catch {
@@ -572,46 +578,85 @@ public class HttpServerPlugin: CAPPlugin {
         return UInt16(bigEndian: resultAddr.sin_port)
     }
 
-    private func localIPv4() -> String {
-        let preferredInterfaces = ["en0", "en1", "bridge100", "pdp_ip0"]
-        var fallback: String?
-        var preferred: String?
+    private func buildStartUrl(ip: String, port: Int) -> String {
+        ip.isEmpty ? "" : "http://\(ip):\(port)"
+    }
 
+    private func emitNoLanInterfaceWarning() {
+        notifyListeners(
+            "server-error",
+            data: [
+                "message": "No reachable LAN interface (Wi-Fi off, Ethernet absent, " +
+                    "hotspot inactive). Server is listening but cannot be reached.",
+                "fatal": false
+            ]
+        )
+    }
+
+    private func localIPv4() -> String {
+        var candidates: [(score: Int, ip: String)] = []
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return "127.0.0.1" }
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return "" }
         defer { freeifaddrs(ifaddr) }
 
         var ptr: UnsafeMutablePointer<ifaddrs>? = first
         while let cur = ptr {
             let iface = cur.pointee
-            let family = iface.ifa_addr.pointee.sa_family
-            if family == UInt8(AF_INET) {
+            guard let ifaAddr = iface.ifa_addr else {
+                ptr = iface.ifa_next
+                continue
+            }
+            let flags = Int32(bitPattern: iface.ifa_flags)
+            let family = ifaAddr.pointee.sa_family
+            let isUp = (flags & IFF_UP) != 0
+            let isRunning = (flags & IFF_RUNNING) != 0
+            let isLoopback = (flags & IFF_LOOPBACK) != 0
+            if family == UInt8(AF_INET), isUp, isRunning, !isLoopback {
                 let name = String(cString: iface.ifa_name)
-                if name != "lo0" {
-                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                    let res = getnameinfo(
-                        iface.ifa_addr,
-                        socklen_t(iface.ifa_addr.pointee.sa_len),
-                        &hostname,
-                        socklen_t(hostname.count),
-                        nil,
-                        0,
-                        NI_NUMERICHOST
-                    )
-                    if res == 0 {
-                        let ipString = String(cString: hostname)
-                        if preferredInterfaces.contains(name) {
-                            preferred = ipString
-                            break
-                        } else if fallback == nil {
-                            fallback = ipString
-                        }
+                var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                let res = getnameinfo(
+                    ifaAddr,
+                    socklen_t(ifaAddr.pointee.sa_len),
+                    &hostname,
+                    socklen_t(hostname.count),
+                    nil,
+                    0,
+                    NI_NUMERICHOST
+                )
+                if res == 0 {
+                    let ip = String(cString: hostname)
+                    if ip.hasPrefix("169.254.") {
+                        ptr = iface.ifa_next
+                        continue
+                    }
+                    let score = scoreInterface(name: name, ipv4: ip)
+                    if score > 0 {
+                        candidates.append((score, ip))
                     }
                 }
             }
             ptr = iface.ifa_next
         }
+        return candidates.max(by: { $0.score < $1.score })?.ip ?? ""
+    }
 
-        return preferred ?? fallback ?? "127.0.0.1"
+    private func scoreInterface(name: String, ipv4: String) -> Int {
+        let cellularPrefixes = ["pdp_ip", "rmnet", "ccmni", "wwan", "utun", "ipsec"]
+        if cellularPrefixes.contains(where: { name.hasPrefix($0) }) { return 0 }
+        if name == "en0" || name == "en1" { return 100 }
+        if name.hasPrefix("en") { return 90 }
+        if name.hasPrefix("bridge") { return 80 }
+        if name.hasPrefix("awdl") || name.hasPrefix("llw") { return 0 }
+        if isRfc1918(ipv4) { return 50 }
+        return 10
+    }
+
+    private func isRfc1918(_ ipv4: String) -> Bool {
+        let parts = ipv4.split(separator: ".").compactMap { Int($0) }
+        guard parts.count == 4 else { return false }
+        let (a, b) = (parts[0], parts[1])
+        return a == 10
+            || (a == 172 && (16...31).contains(b))
+            || (a == 192 && b == 168)
     }
 }
