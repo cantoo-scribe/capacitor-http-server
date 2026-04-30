@@ -292,11 +292,11 @@ Remove every listener registered on this plugin.
 
 #### StartResult
 
-| Prop          | Type                | Description                                                                    |
-| ------------- | ------------------- | ------------------------------------------------------------------------------ |
-| **`port`**    | <code>number</code> | Chosen port (same as options.port when provided).                              |
-| **`url`**     | <code>string</code> | Full URL using the primary LAN IPv4 address, e.g. "http://192.168.1.42:49281". |
-| **`localIp`** | <code>string</code> | Primary LAN IPv4, or "127.0.0.1" if none could be detected.                    |
+| Prop          | Type                | Description                                                                                                                                                                                                                                                                                                            |
+| ------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`port`**    | <code>number</code> | Chosen port (same as options.port when provided).                                                                                                                                                                                                                                                                      |
+| **`url`**     | <code>string</code> | Full URL, e.g. "http://192.168.1.42:49281". **Empty string** when no LAN-reachable interface was found (e.g. cellular only). The server is still listening on the port, but cannot be reached by a peer LAN device. A `server-error` event with `fatal: false` is emitted in that case so consumers can warn the user. |
+| **`localIp`** | <code>string</code> | Primary LAN IPv4. **Empty string** when no LAN-reachable interface was found. See `url`.                                                                                                                                                                                                                               |
 
 
 #### HttpResponse
